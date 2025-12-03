@@ -40,9 +40,6 @@ struct _TidesAlgorithm : public _NT_algorithm
     // Previous output mode for reset detection
     int prev_output_mode;
     
-    // Auto-trigger state for Cycle mode
-    bool initial_trigger_sent;
-    
     // Cached derived values
     float cached_frequency;
     float cached_shape;
@@ -106,7 +103,8 @@ static const char* outputModeNames[] = { "Gates", "Amplitude", "Slope/Phase", "F
 // Parameter definitions
 static const _NT_parameter parameters[] = {
     // Inputs (page 1)
-    NT_PARAMETER_CV_INPUT("Trig/Gate In", 0, 1)
+    // FIXED: Default Trig/Gate to 0 (None) so Cycle mode free-runs
+    NT_PARAMETER_CV_INPUT("Trig/Gate In", 0, 0)
     NT_PARAMETER_CV_INPUT("Clock In", 0, 0)
     NT_PARAMETER_CV_INPUT("V/Oct In", 0, 0)
     NT_PARAMETER_CV_INPUT("FM In", 0, 0)
@@ -243,7 +241,6 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->clock_counter = 0;
     alg->clock_synced = false;
     alg->prev_output_mode = -1;
-    alg->initial_trigger_sent = false;
     
     alg->cached_frequency = 1.0f;
     alg->cached_shape = 0.5f;
@@ -274,10 +271,6 @@ void parameterChanged(_NT_algorithm* self, int p)
             break;
         case kParam_Shift:
             pThis->cached_shift = pThis->v[kParam_Shift] / 1000.0f;
-            break;
-        case kParam_RampMode:
-            // Reset auto-trigger when mode changes so Cycle will re-trigger
-            pThis->initial_trigger_sent = false;
             break;
         case kParam_OutputMode:
             // Reset DSP when output mode changes
@@ -328,15 +321,15 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4)
     const float smooth_atten = pThis->v[kParam_SmoothAtten] / 100.0f;
     const float shift_atten = pThis->v[kParam_ShiftAtten] / 100.0f;
     
-    // Get input pointers
-    const float* trigIn = trigBus ? busFrames + (trigBus - 1) * numFrames : nullptr;
-    const float* clockIn = clockBus ? busFrames + (clockBus - 1) * numFrames : nullptr;
-    const float* voctIn = voctBus ? busFrames + (voctBus - 1) * numFrames : nullptr;
-    const float* fmIn = fmBus ? busFrames + (fmBus - 1) * numFrames : nullptr;
-    const float* shapeIn = shapeBus ? busFrames + (shapeBus - 1) * numFrames : nullptr;
-    const float* slopeIn = slopeBus ? busFrames + (slopeBus - 1) * numFrames : nullptr;
-    const float* smoothIn = smoothBus ? busFrames + (smoothBus - 1) * numFrames : nullptr;
-    const float* shiftIn = shiftBus ? busFrames + (shiftBus - 1) * numFrames : nullptr;
+    // Get input pointers - ONLY if bus is assigned (bus > 0)
+    const float* trigIn = (trigBus > 0) ? busFrames + (trigBus - 1) * numFrames : nullptr;
+    const float* clockIn = (clockBus > 0) ? busFrames + (clockBus - 1) * numFrames : nullptr;
+    const float* voctIn = (voctBus > 0) ? busFrames + (voctBus - 1) * numFrames : nullptr;
+    const float* fmIn = (fmBus > 0) ? busFrames + (fmBus - 1) * numFrames : nullptr;
+    const float* shapeIn = (shapeBus > 0) ? busFrames + (shapeBus - 1) * numFrames : nullptr;
+    const float* slopeIn = (slopeBus > 0) ? busFrames + (slopeBus - 1) * numFrames : nullptr;
+    const float* smoothIn = (smoothBus > 0) ? busFrames + (smoothBus - 1) * numFrames : nullptr;
+    const float* shiftIn = (shiftBus > 0) ? busFrames + (shiftBus - 1) * numFrames : nullptr;
     
     // Process gate/trigger inputs
     for (int i = 0; i < numFrames; ++i) {
@@ -353,16 +346,9 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4)
             }
             pThis->prev_trig_high = trig_high;
         } else if (ramp_mode == tides::RAMP_MODE_LOOPING) {
-            // Cycle mode with no external trigger - auto-trigger to start free-running
-            if (!pThis->initial_trigger_sent) {
-                // Send rising edge on first sample to kickstart oscillator
-                if (i == 0) {
-                    flags = static_cast<tides::GateFlags>(tides::GATE_FLAG_HIGH | tides::GATE_FLAG_RISING);
-                    pThis->initial_trigger_sent = true;
-                }
-            }
-            // Keep gate high so it keeps cycling
-            flags = static_cast<tides::GateFlags>(flags | tides::GATE_FLAG_HIGH);
+            // Cycle mode with no external trigger - just keep gate high for free-running
+            // No rising edge needed - the DSP increments phase continuously in looping mode
+            flags = tides::GATE_FLAG_HIGH;
         }
         
         pThis->gate_buffer[i] = flags;
@@ -435,7 +421,11 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4)
     shift = std::max(0.0f, std::min(1.0f, shift));
     
     // Run DSP
-    const float* ramp_ptr = (clockIn && pThis->clock_synced) ? pThis->ramp_buffer : nullptr;
+    // In Cycle mode, ignore external clock so Frequency knob always controls speed
+    const float* ramp_ptr = 
+        (clockIn && pThis->clock_synced && ramp_mode != tides::RAMP_MODE_LOOPING) 
+            ? pThis->ramp_buffer 
+            : nullptr;
     
     pThis->poly_slope_generator.Render(
         ramp_mode,
